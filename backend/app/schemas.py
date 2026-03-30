@@ -7,7 +7,6 @@ from datetime import datetime
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
-    model: str = "gemini"  # Default model: "gemini", "gpt", or "claude"
 
 
 class ConversationRenameRequest(BaseModel):
