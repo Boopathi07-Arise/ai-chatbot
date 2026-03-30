@@ -2,11 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from google import genai
+from google.genai import types
 import os
 import json
 from dotenv import load_dotenv
 
-# Load .env explicitly using absolute path — works regardless of cwd or import order
 _env_path = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"
 )
@@ -24,54 +24,99 @@ from ..schemas import (
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
-MODEL_NAME = "gemini-2.0-flash"  # fast, free quota, fully supported
+DEFAULT_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
 SYSTEM_INSTRUCTION = (
-    "You are a helpful, friendly AI assistant. "
+    "You are ASHURA, a helpful and powerful AI assistant. "
     "Respond clearly and concisely. Use markdown formatting when appropriate — "
     "use headings, bold, code blocks, and lists to make your answers easy to read. "
     "When writing code, always specify the programming language in fenced code blocks."
 )
 
-# Lazy client cache — initialized on first request so dotenv is always loaded first
-_client: genai.Client | None = None
+_client = None
 
 
-def get_client() -> genai.Client:
-    """Return a cached Gemini client, initializing it on first call."""
+def _build_prompt(system: str, history, user_message: str) -> str:
+    prompt_lines = [system]
+    for msg in history:
+        if msg.role == "user":
+            prompt_lines.append(f"User: {msg.content}")
+        else:
+            prompt_lines.append(f"Assistant: {msg.content}")
+    prompt_lines.append(f"User: {user_message}")
+    prompt_lines.append("Assistant:")
+    return "\n".join(prompt_lines)
+
+
+def _query_models(prompt: str) -> str:
+    client = get_client()
+    last_error = None
+    for model in DEFAULT_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=512,
+                ),
+            )
+            return response.text
+        except Exception as e:
+            err = str(e).lower()
+            if "quota exceeded" in err or "rate limit" in err:
+                last_error = e
+                continue
+            raise
+    if last_error is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Gemini quota exceeded across default models. "
+                "Enable billing or use another API key."
+            ),
+        )
+    raise HTTPException(
+        status_code=500,
+        detail="Failed to generate response from Gemini models.",
+    )
+
+
+def get_client():
+    """Return a cached Gemini client."""
     global _client
     if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise HTTPException(
                 status_code=500,
-                detail="GEMINI_API_KEY is not set. Add it to your backend/.env file.",
+                detail=(
+                    "GEMINI_API_KEY is not set. "
+                    "Add it to your backend/.env file."
+                ),
             )
         print(f"[INFO] Initializing Gemini client with key: {api_key[:8]}...")
         _client = genai.Client(api_key=api_key)
     return _client
 
 
-def _build_history(messages) -> list:
-    """Convert DB messages to Gemini-compatible message history."""
-    history = []
-    for msg in messages:
-        role = "user" if msg.role == "user" else "model"
-        history.append({"role": role, "parts": [{"text": msg.content}]})
-    return history
+def _build_messages(system: str, history, user_message: str) -> list:
+    """Build Gemini chat message array with system + history + newest user message."""
+    messages = [{"role": "system", "content": system}]
+    for msg in history:
+        role = "user" if msg.role == "user" else "assistant"
+        messages.append({"role": role, "content": msg.content})
+    messages.append({"role": "user", "content": user_message})
+    return messages
 
 
 def _generate_title(user_message: str) -> str:
     """Use Gemini to generate a short conversation title."""
     try:
-        client = get_client()
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=(
-                f"Generate a very short concise title (max 5 words, no quotes, no punctuation at end) "
-                f'for a conversation that starts with this message: "{user_message}"'
-            ),
+        prompt = (
+            f"Generate a very short concise title (max 5 words, no quotes, "
+            f"no punctuation at end) for a conversation that starts with: \"{user_message}\""
         )
-        return response.text.strip().strip('"').strip("'")[:50]
+        return _query_models(prompt).split('\n')[0][:50]
     except Exception:
         return user_message[:40] + "..." if len(user_message) > 40 else user_message
 
@@ -81,7 +126,6 @@ def _generate_title(user_message: str) -> str:
 
 @router.get("/conversations", response_model=list[ConversationResponse])
 def list_conversations(db: Session = Depends(get_db)):
-    """List all conversations, newest first."""
     return (
         db.query(Conversation)
         .order_by(Conversation.updated_at.desc())
@@ -91,7 +135,6 @@ def list_conversations(db: Session = Depends(get_db)):
 
 @router.post("/conversations", response_model=ConversationResponse)
 def create_conversation(db: Session = Depends(get_db)):
-    """Create a new empty conversation."""
     convo = Conversation()
     db.add(convo)
     db.commit()
@@ -101,7 +144,6 @@ def create_conversation(db: Session = Depends(get_db)):
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
 def get_conversation(conversation_id: str, db: Session = Depends(get_db)):
-    """Get a conversation with all its messages."""
     convo = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not convo:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -114,7 +156,6 @@ def rename_conversation(
     body: ConversationRenameRequest,
     db: Session = Depends(get_db),
 ):
-    """Rename a conversation."""
     convo = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not convo:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -126,7 +167,6 @@ def rename_conversation(
 
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
-    """Delete a conversation and all its messages."""
     convo = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not convo:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -140,8 +180,7 @@ def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, db: Session = Depends(get_db)):
-    """Send a message and get a full (non-streaming) response."""
-    # Get or create conversation
+    """Send a message and get a full response."""
     if request.conversation_id:
         convo = db.query(Conversation).filter(Conversation.id == request.conversation_id).first()
         if not convo:
@@ -152,32 +191,23 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(convo)
 
-    # Build history before saving the new user message
-    history = _build_history(convo.messages)
-
-    # Save user message
+    history = convo.messages
     user_msg = Message(conversation_id=convo.id, role="user", content=request.message)
     db.add(user_msg)
     db.commit()
 
     try:
-        client = get_client()
+        prompt = _build_prompt(SYSTEM_INSTRUCTION, history, request.message)
+        assistant_text = _query_models(prompt)
 
-        chat_session = client.chats.create(
-            model=MODEL_NAME,
-            history=history,
-            config={"system_instruction": SYSTEM_INSTRUCTION},
-        )
-        response = chat_session.send_message(request.message)
-        assistant_text = response.text
 
-        # Save assistant message
         assistant_msg = Message(
-            conversation_id=convo.id, role="assistant", content=assistant_text
+            conversation_id=convo.id,
+            role="assistant",
+            content=assistant_text,
         )
         db.add(assistant_msg)
 
-        # Auto-generate title on first message
         if convo.title == "New Chat":
             convo.title = _generate_title(request.message)
 
@@ -188,13 +218,20 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_str = str(e)
+        if "403" in error_str or "api_key" in error_str.lower() or "authentication" in error_str.lower():
+            detail = (
+                "GEMINI_API_KEY is invalid or account has no quota. "
+                "Check your API key in backend/.env."
+            )
+        else:
+            detail = f"Error: {error_str}"
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @router.post("/chat/stream")
 def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
     """Send a message and stream the response via Server-Sent Events."""
-    # Get or create conversation
     if request.conversation_id:
         convo = db.query(Conversation).filter(Conversation.id == request.conversation_id).first()
         if not convo:
@@ -205,10 +242,7 @@ def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(convo)
 
-    # Build history before saving the new user message
-    history = _build_history(convo.messages)
-
-    # Save user message
+    history = convo.messages
     user_msg = Message(conversation_id=convo.id, role="user", content=request.message)
     db.add(user_msg)
     db.commit()
@@ -216,9 +250,9 @@ def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
     conversation_id = convo.id
     is_new_chat = convo.title == "New Chat"
     user_message_text = request.message
+    messages = _build_messages(SYSTEM_INSTRUCTION, history, request.message)
 
     def event_generator():
-        # Validate client is available before streaming starts
         try:
             client = get_client()
         except HTTPException as e:
@@ -229,29 +263,53 @@ def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
         db_inner = next(get_db())
 
         try:
-            chat_session = client.chats.create(
-                model=MODEL_NAME,
-                history=history,
-                config={"system_instruction": SYSTEM_INSTRUCTION},
-            )
+            full_response = ""
+            prompt = _build_prompt(SYSTEM_INSTRUCTION, history, user_message_text)
 
-            for chunk in chat_session.send_message_stream(user_message_text):
-                if chunk.text:
-                    full_response += chunk.text
-                    data = json.dumps({
-                        "type": "chunk",
-                        "content": chunk.text,
-                        "conversation_id": conversation_id,
-                    })
-                    yield f"data: {data}\n\n"
+            for model in DEFAULT_MODELS:
+                try:
+                    stream = client.models.generate_content_stream(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.2,
+                            max_output_tokens=512,
+                        ),
+                    )
+                    for chunk in stream:
+                        text_chunk = getattr(chunk, "text", "")
+                        if text_chunk:
+                            full_response += text_chunk
+                            data = json.dumps({
+                                "type": "chunk",
+                                "content": text_chunk,
+                                "conversation_id": conversation_id,
+                            })
+                            yield f"data: {data}\n\n"
 
-            # Save full assistant response to DB
-            assistant_msg = Message(
-                conversation_id=conversation_id, role="assistant", content=full_response
-            )
-            db_inner.add(assistant_msg)
+                    assistant_msg = Message(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=full_response,
+                    )
+                    db_inner.add(assistant_msg)
+                    break
 
-            # Auto-title on first message
+                except Exception as e:
+                    err_lower = str(e).lower()
+                    if "quota exceeded" in err_lower or "rate limit" in err_lower:
+                        continue
+                    raise
+
+            else:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Gemini streaming quota exceeded for all fallback models. "
+                        "Enable billing or change API key."
+                    ),
+                )
+
             if is_new_chat:
                 title = _generate_title(user_message_text)
                 convo_obj = (
@@ -270,12 +328,16 @@ def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
 
             db_inner.commit()
 
-            # Signal completion
             data = json.dumps({"type": "done", "conversation_id": conversation_id})
             yield f"data: {data}\n\n"
 
         except Exception as e:
-            data = json.dumps({"type": "error", "content": str(e)})
+            error_str = str(e)
+            if "403" in error_str or "api_key" in error_str.lower() or "authentication" in error_str.lower():
+                error_content = "GEMINI_API_KEY is invalid or account has no quota. Check your API key in backend/.env."
+            else:
+                error_content = error_str
+            data = json.dumps({"type": "error", "content": error_content})
             yield f"data: {data}\n\n"
         finally:
             db_inner.close()
